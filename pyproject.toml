@@ -1,0 +1,33 @@
+[project]
+name = "nanocode"
+version = "0.1.0"
+description = "A scoped-down Claude Code, built on deep-agent patterns"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=1.0.0",
+    "langgraph>=1.0.0",
+    "langchain-anthropic>=1.0.0",
+    "langchain-openai>=1.0.0",
+    "rich>=14.0.0",
+    "typer>=0.15.0",
+]
+
+[project.optional-dependencies]
+search = ["langchain-tavily>=0.2.0"]
+
+[project.scripts]
+nanocode = "nanocode.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nanocode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
