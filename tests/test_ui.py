@@ -48,13 +48,23 @@ def test_summary_reports_changes_and_delegations(tmp_path):
     assert "src/app.py" in out and "+18 -2" in out
     assert "tests/test_app.py" in out and "(new)" in out
     assert "explorer" in out and "test-runner" in out
-    assert "nanocode --resume" in out
+    # A finished plan gets no pick-up notice — it isn't waiting on anything.
+    assert "picked up automatically" not in out
 
 
 def test_summary_is_honest_about_an_incomplete_plan(tmp_path):
     todos = [Todo(content="a", status="completed"), Todo(content="b", status="pending")]
     out = rendered(lambda ui: ui.summary(todos, [], Path(tmp_path)))
     assert "1/2 todos complete" in out
+    # No flag to memorise: running nanocode here again picks it up.
+    assert "picked up automatically" in out
+
+
+def test_summary_reports_constraints_in_force(tmp_path):
+    out = rendered(
+        lambda ui: ui.summary([], [], Path(tmp_path), constraints=["no auth edits", "py3.11"])
+    )
+    assert "2 in force" in out
 
 
 def test_glyphs_fall_back_to_ascii_on_a_legacy_console(monkeypatch):

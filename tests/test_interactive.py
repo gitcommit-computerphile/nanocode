@@ -199,6 +199,168 @@ def test_the_session_file_is_written_after_every_ask(project, quiet, monkeypatch
     assert len(saved["session_log"]) == 1
 
 
+def test_a_whole_session_writes_exactly_one_file(project, quiet, monkeypatch):
+    """One run is one file — asks within it update it, they don't multiply it."""
+    model = Scripted([AIMessage("one"), AIMessage("two"), AIMessage("three")])
+    orch = build_orchestrator(model=model, root=project)
+    asks = iter(["second", "third", None])
+    monkeypatch.setattr("nanocode.cli._prompt", lambda _c: next(asks))
+
+    _session_loop(orch, NanocodeUI(quiet, live=False), quiet, project, "first", "first", once=False)
+
+    assert len(session.list_sessions(project)) == 1
+
+
+def test_a_later_session_does_not_clobber_an_earlier_one(project, quiet, monkeypatch):
+    """The bug this fixes: starting work used to destroy the previous record."""
+    monkeypatch.setattr("nanocode.cli._prompt", lambda _c: None)
+
+    first = build_orchestrator(model=Scripted([AIMessage("done")]), root=project)
+    _session_loop(first, NanocodeUI(quiet, live=False), quiet, project, "first run", "first run", once=False)
+
+    # A distinct id, the way a genuinely later run would have.
+    monkeypatch.setattr(session, "new_session_id", lambda *_: "20991231T235959")
+    second = build_orchestrator(model=Scripted([AIMessage("done")]), root=project)
+    _session_loop(second, NanocodeUI(quiet, live=False), quiet, project, "second run", "second run", once=False)
+
+    tasks = [session.load(project, path.stem)["task"] for path in session.list_sessions(project)]
+    assert sorted(tasks) == ["first run", "second run"]
+
+
+# -- constraints cross the session boundary -------------------------------
+
+
+def test_constraints_are_seeded_into_the_session(project, quiet, monkeypatch):
+    model = Scripted([AIMessage("understood")])
+    orch = build_orchestrator(model=model, root=project)
+    monkeypatch.setattr("nanocode.cli._prompt", lambda _c: None)
+
+    _session_loop(
+        orch,
+        NanocodeUI(quiet, live=False),
+        quiet,
+        project,
+        "do a thing",
+        "do a thing",
+        once=False,
+        constraints=["do not modify the auth module"],
+    )
+
+    text = "\n".join(str(m.content) for m in model.calls[0])
+    assert "do not modify the auth module" in text
+
+
+# -- picking work up without being asked ----------------------------------
+
+
+@pytest.fixture
+def captured(monkeypatch):
+    """Run the CLI down to the point the session loop would start."""
+    seen: dict = {}
+
+    def fake_loop(orch, ui, console, root, opening, task_label, once, constraints=None):
+        seen.update(opening=opening, task_label=task_label, constraints=constraints or [])
+        return 0
+
+    monkeypatch.setattr("nanocode.cli.build_orchestrator", lambda **kw: object())
+    monkeypatch.setattr("nanocode.cli._session_loop", fake_loop)
+    return seen
+
+
+def invoke(project, *args):
+    from typer.testing import CliRunner
+
+    from nanocode.cli import app
+
+    return CliRunner().invoke(app, ["-C", str(project), *args])
+
+
+def _unfinished(project):
+    session.save(
+        project,
+        {
+            "todos": [
+                {"content": "find the handler", "status": "completed"},
+                {"content": "update the tests", "status": "pending"},
+            ],
+            "session_log": [],
+        },
+        "add rate limiting",
+        "20260814T120000",
+    )
+
+
+def test_unfinished_work_is_picked_up_without_a_flag(project, captured):
+    """The flag that rescues you shouldn't be one you need before you need it."""
+    _unfinished(project)
+    invoke(project)
+
+    assert "update the tests" in captured["opening"]
+    assert captured["task_label"] == "add rate limiting"
+
+
+def test_fresh_ignores_unfinished_work_and_constraints(project, captured):
+    _unfinished(project)
+    session.save_constraints(project, ["do not modify the auth module"])
+    invoke(project, "--fresh", "something else")
+
+    assert captured["opening"] == "something else"
+    assert captured["constraints"] == []
+
+
+def test_a_finished_run_does_not_haunt_the_next_one(project, captured):
+    session.save(
+        project,
+        {"todos": [{"content": "all done", "status": "completed"}], "session_log": []},
+        "yesterday's task",
+        "20260814T120000",
+    )
+    invoke(project, "a new thing")
+
+    assert captured["opening"] == "a new thing"
+
+
+def test_a_new_ask_is_appended_to_the_briefing(project, captured):
+    _unfinished(project)
+    invoke(project, "actually, skip the tests")
+
+    assert "update the tests" in captured["opening"]
+    assert captured["opening"].endswith("actually, skip the tests")
+
+
+def test_constraints_are_loaded_from_disk_at_startup(project, captured):
+    session.save_constraints(project, ["do not modify the auth module"])
+    invoke(project, "do a thing")
+
+    assert captured["constraints"] == ["do not modify the auth module"]
+
+
+def test_once_does_not_pick_up_unfinished_work(project, captured):
+    """Scripted runs get what they asked for and nothing else."""
+    _unfinished(project)
+    invoke(project, "--once", "run the tests")
+
+    assert captured["opening"] == "run the tests"
+
+
+def test_resume_still_forces_a_pick_up_of_a_finished_run(project, captured):
+    session.save(
+        project,
+        {"todos": [{"content": "all done", "status": "completed"}], "session_log": []},
+        "yesterday's task",
+        "20260814T120000",
+    )
+    invoke(project, "--resume")
+
+    assert "yesterday's task" in captured["opening"]
+
+
+def test_resume_with_nothing_to_resume_is_an_error(project, captured):
+    result = invoke(project, "--resume")
+    assert result.exit_code == 1
+    assert "nothing to resume" in result.output
+
+
 # -- the prompt -----------------------------------------------------------
 
 

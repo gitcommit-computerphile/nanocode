@@ -104,7 +104,7 @@ def test_a_full_run_plans_edits_records_and_resumes(project):
     assert _changed_files(state["session_log"]) == {"src/app.py": "+2 -1"}
 
     # The session is written, and resuming rebuilds context from it.
-    session.save(project, state, task="add rate limiting to the handler")
+    session.save(project, state, "add rate limiting to the handler", "20260814T120000")
     saved = session.load(project)
     assert saved["todos"] == plan_v2
     prompt = session.resume_prompt(saved)

@@ -18,16 +18,18 @@ from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 
 from . import prompts
+from .constraints import make_constraints_tool
 from .fs_tools import DiskFileSystem, FileSystem, make_fs_tools
 from .search_tool import make_search_tool
 from .shell_tool import make_shell_tool
 from .state import NanocodeState
 from .subagents import make_delegate_tool
-from .todo_tools import DEFAULT_CONTEXT_WINDOW, make_compactor, recite_todos, write_todos
+from .todo_tools import DEFAULT_CONTEXT_WINDOW, make_compactor, recite_context, write_todos
 
 # One flag picks the provider and model for the whole run — the orchestrator
 # and every sub-agent share it, so nothing mixes providers mid-task.
@@ -56,6 +58,17 @@ class Orchestrator:
     fs: FileSystem
     root: Path
     tools: list[BaseTool] = field(default_factory=list)
+    # What the user asked for, kept for display and for rebuilding on a swap.
+    spec: str = ""
+    context_window: int = DEFAULT_CONTEXT_WINDOW
+    on_trace: Callable[[str, str], None] | None = None
+    # Held so a mid-session model swap can hand the same one to the replacement
+    # graph — that is what carries the conversation across the swap.
+    checkpointer: BaseCheckpointSaver | None = None
+    # Mutable: `/clear` rotates it. Everything in state hangs off the thread id,
+    # including `session_log`, whose `operator.add` reducer means it cannot be
+    # emptied by assignment — a new thread is the only real reset.
+    thread: str = SESSION_THREAD
 
     @property
     def config(self) -> dict:
@@ -65,7 +78,7 @@ class Orchestrator:
         resumes the same checkpointed state instead of starting cold.
         """
         return {
-            "configurable": {"thread_id": SESSION_THREAD},
+            "configurable": {"thread_id": self.thread},
             "recursion_limit": RECURSION_LIMIT,
         }
 
@@ -91,8 +104,9 @@ def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
     key_var = PROVIDER_KEYS.get(provider)
     if key_var and not os.environ.get(key_var):
         raise ConfigError(
-            f"{key_var} is not set, but --model {model!r} needs it.\n"
-            f"  export {key_var}=..."
+            f"{key_var} is not set, but {model!r} needs it.\n"
+            f"  set it in this terminal (export {key_var}=...), "
+            f"or run /model inside nanocode to enter it"
         )
 
     try:
@@ -108,19 +122,26 @@ def build_orchestrator(
     fs: FileSystem | None = None,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
     on_trace: Callable[[str, str], None] | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> Orchestrator:
     """Wire the orchestrator: one model, one tool set, two middlewares.
 
     The same `model` string flows into every sub-agent built by the registry —
     one flag picks the provider for the whole run, so nothing mixes providers
     mid-task.
+
+    Passing an existing `checkpointer` rebuilds the graph around a conversation
+    that is already underway, which is how `/model` swaps the model without
+    costing the user their context.
     """
     project_root = Path(root).resolve()
     llm = resolve_model(model)
+    saver = checkpointer if checkpointer is not None else InMemorySaver()
     filesystem = fs if fs is not None else DiskFileSystem(project_root)
 
     tools: list[BaseTool] = [
         write_todos,
+        make_constraints_tool(project_root),
         *make_fs_tools(filesystem, writable=True),
         make_shell_tool(project_root),
         make_delegate_tool(llm, filesystem, project_root, on_trace=on_trace),
@@ -133,11 +154,21 @@ def build_orchestrator(
         tools=tools,
         system_prompt=prompts.ORCHESTRATOR_PROMPT,
         state_schema=NanocodeState,
-        middleware=[recite_todos, make_compactor(context_window)],
+        middleware=[recite_context, make_compactor(context_window)],
         # One orchestrator instance serves the whole session. The checkpointer
         # is what carries the conversation from one ask to the next: turn two
         # sees everything turn one did, without replaying or re-explaining it.
-        checkpointer=InMemorySaver(),
+        checkpointer=saver,
         name="nanocode",
     )
-    return Orchestrator(agent=agent, model=llm, fs=filesystem, root=project_root, tools=tools)
+    return Orchestrator(
+        agent=agent,
+        model=llm,
+        fs=filesystem,
+        root=project_root,
+        tools=tools,
+        spec=model if isinstance(model, str) else getattr(llm, "model_name", "custom model"),
+        context_window=context_window,
+        on_trace=on_trace,
+        checkpointer=saver,
+    )

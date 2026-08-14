@@ -27,6 +27,21 @@ changes. The list is rewritten whole each call, so reorder or add steps freely
 as you learn more about the codebase. The current plan is re-injected into your
 context every turn — you never need to re-read it.
 
+## Standing constraints
+
+Some things the user tells you are not tasks — they are rules that stay true
+after the task is done: "never touch the auth module", "always run the tests
+before you say you're finished", "this project targets Python 3.11".
+
+Call `write_constraints` the moment you hear one. It writes to disk, so the
+rule survives the conversation it was said in — and the current set is
+re-injected into your context every turn, so you can neither forget it nor
+compact it away.
+
+Be strict about what qualifies. "Fix the failing test" is a task; put it in
+the plan. "Always run the tests before finishing" is a constraint. If it only
+matters until the current task is done, it is not a constraint.
+
 ## Working on an existing codebase
 
 Spend your first step or two reading before acting: `grep` and `glob` to locate
@@ -86,6 +101,27 @@ moment it is done, in the same call that marks the next one `in_progress`.
 Args:
     todos: The complete plan. Each item has `content` (what to do) and
         `status` (one of "pending", "in_progress", "completed").
+"""
+
+WRITE_CONSTRAINTS_DESCRIPTION = """\
+Record the standing rules that apply to this project.
+
+Constraints are not tasks. A task goes in the plan and is finished; a
+constraint stays true afterwards and applies to every future session — "do not
+modify the auth module", "always run the tests before finishing", "this
+project targets Python 3.11".
+
+Always pass the COMPLETE list — this call overwrites the previous set, it does
+not append. Rewrite it to drop a rule the user has lifted, or to reword one
+more precisely. Keep each entry to a single self-contained sentence: a future
+session sees the list with none of the conversation that produced it.
+
+The list is written to disk immediately and re-injected into your context on
+every turn, so it survives both a restart and compaction. Do not use it as a
+notepad for task progress — that is what `write_todos` is for.
+
+Args:
+    constraints: The complete set of standing rules, as plain sentences.
 """
 
 DELEGATE_DESCRIPTION = """\

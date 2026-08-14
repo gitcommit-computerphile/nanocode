@@ -155,6 +155,7 @@ class NanocodeUI:
         session_log: list[Event],
         log_dir: Path,
         resumable: bool = True,
+        constraints: list[str] | None = None,
     ) -> None:
         done = sum(1 for t in todos if t["status"] == "completed")
         self.console.print()
@@ -180,10 +181,13 @@ class NanocodeUI:
         shells = sum(1 for e in session_log if e.get("kind") == "shell")
         if shells:
             rows.append(("shell commands", str(shells)))
+        if constraints:
+            rows.append(("constraints", f"{len(constraints)} in force"))
         if log_dir.exists():
             rows.append(("full logs", log_dir.as_posix()))
-        if resumable:
-            rows.append(("resume", "nanocode --resume"))
+        if resumable and todos and done < len(todos):
+            # No flag to remember: running `nanocode` here again picks this up.
+            rows.append(("unfinished", "picked up automatically next run"))
 
         if rows:
             meta = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
