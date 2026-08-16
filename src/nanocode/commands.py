@@ -243,11 +243,20 @@ def _switch(ctx: CommandContext, spec: str) -> None:
     try:
         replacement = build_orchestrator(
             model=spec,
+            # /model switches the orchestrator's model; a separate sub-agent
+            # model was a cost decision and stays as it was.
+            subagent_model=ctx.orch.subagent_spec or None,
             root=ctx.orch.root,
             fs=ctx.orch.fs,
             context_window=ctx.orch.context_window,
             on_trace=ctx.orch.on_trace,
+            on_retry=ctx.orch.on_retry,
+            on_compact=ctx.orch.on_compact,
             checkpointer=ctx.orch.checkpointer,
+            # Same tally, so a mid-session swap doesn't reset what you've spent.
+            usage=ctx.orch.usage,
+            # Reuse the detection rather than paying for it again.
+            git_context=ctx.orch.git,
         )
     except ConfigError as exc:
         ctx.console.print(f"[red]{GLYPH['fail']}[/red] {_escape(str(exc))}")

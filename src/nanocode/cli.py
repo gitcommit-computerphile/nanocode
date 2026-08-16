@@ -9,11 +9,12 @@ make it return JSON" knows what "it" is. `--once` runs a single task and exits
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from rich.console import Console
 
 from . import commands, session
@@ -46,6 +47,15 @@ def run(
             help="provider:name — used by the orchestrator and every sub-agent.",
         ),
     ] = DEFAULT_MODEL,
+    subagent_model: Annotated[
+        str,
+        typer.Option(
+            "--subagent-model",
+            help="provider:name for sub-agents only. They grep, read and run tests — "
+            "execution, not judgment — so a cheaper model usually suffices. "
+            "Defaults to --model.",
+        ),
+    ] = "",
     directory: Annotated[
         Path,
         typer.Option("--dir", "-C", help="Project root. The agent is sandboxed to it."),
@@ -121,33 +131,46 @@ def run(
 
     try:
         ui = NanocodeUI(console, live=not plain)
-        orch = build_orchestrator(
-            model=model,
-            root=root,
-            context_window=context_window,
-            on_trace=ui.subagent,
-        )
+        # Resolving the model can take a moment, and git detection runs here
+        # too — the one startup pause the user would otherwise stare at.
+        with console.status("[dim]starting…[/dim]", spinner="dots"):
+            orch = build_orchestrator(
+                model=model,
+                subagent_model=subagent_model or None,
+                root=root,
+                context_window=context_window,
+                on_trace=ui.subagent,
+                on_retry=ui.warn,
+                on_compact=ui.compacting,
+            )
     except ConfigError as exc:
         console.print(f"[red]{GLYPH['fail']}[/red] {exc}")
         raise typer.Exit(2)
 
-    console.print(f"[dim]nanocode · {model} · {root}[/dim]")
+    notes: list[str] = []
     if picked_up:
         todos = saved.get("todos") or []
         done = sum(1 for t in todos if t.get("status") == "completed")
-        console.print(
-            f"[dim]picking up where the last run stopped — {done}/{len(todos)} steps done "
-            "(--fresh to start clean)[/dim]"
+        notes.append(
+            f"picking up the last run — {done}/{len(todos)} steps done (--fresh to start clean)"
         )
     if constraints:
-        console.print(
-            f"[dim]{len(constraints)} standing constraint"
-            f"{'' if len(constraints) == 1 else 's'} loaded "
-            f"from {session.constraints_path(root).name}[/dim]"
-        )
+        plural = "" if len(constraints) == 1 else "s"
+        notes.append(f"{len(constraints)} standing constraint{plural} loaded")
+
+    if orch.git is not None and orch.git.enabled:
+        orch.git.refresh()
+    ui.header(
+        model=model,
+        root=root,
+        branch=orch.git.branch if orch.git else "",
+        changed=len(orch.git.changed) if orch.git else 0,
+        subagent_model=subagent_model,
+        note=" · ".join(notes),
+    )
     if not once:
         console.print(
-            "[dim]ask for anything · /help for commands · 'exit' or Ctrl-D when you're done[/dim]"
+            "\n[dim]  ask for anything · /help for commands · 'exit' when you're done[/dim]"
         )
 
     raise typer.Exit(
@@ -197,6 +220,7 @@ def _session_loop(
 
     while True:
         if not ask:
+            ui.status(ctx.orch.usage, ctx.orch.context_window)
             ask = _prompt(console)
             if ask is None:  # exit, or Ctrl-D
                 break
@@ -216,12 +240,22 @@ def _session_loop(
             ask = ""
             continue
 
+        # One git call per ask, not per model call — the result is then read
+        # from cache by every turn's recitation.
+        if ctx.orch.git is not None:
+            ctx.orch.git.refresh()
+
         # session_log accumulates across the whole session; the summary after
-        # each ask should describe only what that ask did.
+        # each ask should describe only what that ask did. `plan_before` serves
+        # the same purpose for todos, which also survive between asks — without
+        # it, a follow-up question inherits the previous ask's plan and gets
+        # reported as though it had done the work.
         offset = len(state.get("session_log") or [])
+        plan_before = state.get("todos") or []
+        started = time.monotonic()
         try:
             with ui:
-                state = _drive(ctx.orch, ask, ui, seed=seed)
+                state = _drive(ctx.orch, ask, ui, seed=seed, plan_before=plan_before)
             seed = None
         except KeyboardInterrupt:
             ui.warn("interrupted — progress saved" + ("" if once else "; ask again or 'exit'"))
@@ -235,13 +269,19 @@ def _session_loop(
                 # overwrites the record of another.
                 session.save(root, state, task_label, session_id)
 
-        ui.summary(
-            todos=state.get("todos") or [],
-            session_log=(state.get("session_log") or [])[offset:],
-            log_dir=logs_dir(root),
-            resumable=not once,
-            constraints=state.get("constraints") or [],
-        )
+        todos_now = state.get("todos") or []
+        new_events = (state.get("session_log") or [])[offset:]
+        # An ask that neither touched the plan nor recorded anything was a
+        # conversational turn, whatever stale plan happens to be in state.
+        if new_events or todos_now != plan_before:
+            ui.summary(
+                todos=todos_now,
+                session_log=new_events,
+                log_dir=logs_dir(root),
+                resumable=not once,
+                constraints=state.get("constraints") or [],
+                seconds=time.monotonic() - started,
+            )
 
         if once:
             break
@@ -277,22 +317,43 @@ def _drive(
     ask: str,
     ui: NanocodeUI,
     seed: dict[str, Any] | None = None,
+    plan_before: list | None = None,
 ) -> dict[str, Any]:
     """Stream one ask to completion, rendering each new message as it lands.
 
     `seed` sets state fields alongside the ask — used once at startup to load
-    the project's constraints in from disk.
+    the project's constraints in from disk. `plan_before` is the plan as it
+    stood when the ask began, so a plan left over from an earlier task isn't
+    redisplayed under an answer that never touched it.
     """
     state: dict[str, Any] = {}
+    plan_before = plan_before or []
     seen = 0
-    for chunk in orch.agent.stream(
+    # The gap between hitting enter and the first token is the longest silence
+    # in the whole loop; it gets an indicator from the outset.
+    ui.begin_thinking()
+    for mode, payload in orch.agent.stream(
         {"messages": [HumanMessage(ask)], **(seed or {})},
         config=orch.config,
-        stream_mode="values",
+        # "values" gives whole-state snapshots (what to render and record);
+        # "messages" gives token deltas as they arrive (what to stream).
+        stream_mode=["values", "messages"],
     ):
-        state = chunk
-        ui.set_todos(chunk.get("todos") or [])
-        messages = chunk.get("messages") or []
+        if mode == "messages":
+            _stream_token(payload, ui)
+            continue
+
+        state = payload
+        # Tokens for the reply just finished are committed before anything else
+        # prints, so a tool line can't land in the middle of a sentence.
+        streamed = ui.end_stream()
+        # Only once this ask has touched the plan. Todos survive between asks,
+        # so otherwise a follow-up question renders a finished plan from an
+        # earlier task underneath an unrelated answer.
+        todos = payload.get("todos") or []
+        if todos != plan_before:
+            ui.set_todos(todos)
+        messages = payload.get("messages") or []
         if seen == 0:
             # Continuing a session: everything already on the thread is history,
             # and was rendered when it first happened. Only show what's new.
@@ -302,21 +363,63 @@ def _drive(
             seen = len(messages)
             continue
         for message in messages[seen:]:
-            _render(message, ui)
+            _render(message, ui, orch, already_shown=streamed)
         seen = len(messages)
+    ui.end_stream()
+    ui.end_thinking()
     return state
 
 
-def _render(message: Any, ui: NanocodeUI) -> None:
+def _stream_token(payload: Any, ui: NanocodeUI) -> None:
+    """Render one token delta, if it belongs to the orchestrator.
+
+    A sub-agent runs its own graph inside the delegate tool, and LangChain
+    propagates the streaming callbacks into it — so its private reasoning
+    arrives here too, tagged with `langgraph_node == "tools"`. Showing it would
+    break the isolation the whole sub-agent design rests on: the orchestrator
+    is supposed to see one summary, and so is the user.
+    """
+    try:
+        chunk, metadata = payload
+    except (TypeError, ValueError):
+        return
+    if (metadata or {}).get("langgraph_node") != "model":
+        return
+    if not isinstance(chunk, AIMessageChunk):
+        return
+    ui.stream(_text_of(chunk))
+
+
+def _text_of(chunk: Any) -> str:
+    content = getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def _render(message: Any, ui: NanocodeUI, orch: Orchestrator, already_shown: bool = False) -> None:
     if isinstance(message, AIMessage):
+        # Usage lands on the assembled message, not the deltas. is_context
+        # marks this as an orchestrator call, so it sets the context gauge.
+        orch.usage.record(message, is_context=True)
         for call in message.tool_calls or []:
             if call["name"] not in QUIET_TOOLS:
-                ui.tool(call["name"], _describe(call))
+                # Opened here, closed when its result lands — that pairing is
+                # what produces both the live spinner and the duration.
+                ui.begin_tool(call["id"], call["name"], _describe(call))
         text = getattr(message, "text", None) or message.content
-        if isinstance(text, str) and text.strip() and not message.tool_calls:
+        if not already_shown and isinstance(text, str) and text.strip() and not message.tool_calls:
             ui.assistant(text)
-    elif isinstance(message, ToolMessage) and message.status == "error":
-        ui.error(_first_line(str(message.content)))
+    elif isinstance(message, ToolMessage):
+        ui.end_tool(message.tool_call_id)
+        if message.status == "error":
+            ui.error(_first_line(str(message.content)))
 
 
 def _describe(call: dict[str, Any]) -> str:

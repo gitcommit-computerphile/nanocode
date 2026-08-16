@@ -250,6 +250,114 @@ def test_constraints_are_seeded_into_the_session(project, quiet, monkeypatch):
     assert "do not modify the auth module" in text
 
 
+# -- a follow-up question is not a second helping of the last task --------
+
+
+def test_a_follow_up_question_does_not_inherit_the_previous_summary(project, quiet, monkeypatch):
+    """Todos survive between asks, so a stale plan used to make "done?" print
+    a full work report — elapsed time, log paths, "0/4 todos complete" — for a
+    one-line answer that changed nothing."""
+    plan = [{"content": "build the thing", "status": "in_progress"}]
+    model = Scripted(
+        [
+            AIMessage(content="", tool_calls=[tool_call("write_todos", todos=plan)]),
+            AIMessage(content="", tool_calls=[tool_call("write_file", path="a.py", content="A\n")]),
+            AIMessage("started on it"),
+            AIMessage("Not yet — still working on it."),  # the follow-up question
+        ]
+    )
+    orch = build_orchestrator(model=model, root=project)
+    asks = iter(["done?", None])
+    monkeypatch.setattr("nanocode.cli._prompt", lambda _c: next(asks))
+
+    _session_loop(orch, NanocodeUI(quiet, live=False), quiet, project, "build it", "build it", once=False)
+
+    out = quiet.file.getvalue()
+    assert out.count("todos complete") == 1, "the follow-up printed its own work summary"
+    assert out.count("full logs") == 1, "only the ask that did work should report"
+
+
+def test_a_real_second_task_still_gets_its_own_summary(project, quiet, monkeypatch):
+    """The other direction — don't silence genuine work."""
+    model = Scripted(
+        [
+            AIMessage(content="", tool_calls=[tool_call("write_file", path="a.py", content="A\n")]),
+            AIMessage("first done"),
+            AIMessage(content="", tool_calls=[tool_call("write_file", path="b.py", content="B\n")]),
+            AIMessage("second done"),
+        ]
+    )
+    orch = build_orchestrator(model=model, root=project)
+    asks = iter(["write b.py", None])
+    monkeypatch.setattr("nanocode.cli._prompt", lambda _c: next(asks))
+
+    _session_loop(orch, NanocodeUI(quiet, live=False), quiet, project, "write a.py", "write a.py", once=False)
+
+    out = quiet.file.getvalue()
+    assert "a.py" in out and "b.py" in out, "both asks did real work and both should report it"
+
+
+def test_a_follow_up_question_does_not_redisplay_the_old_plan(project):
+    """The other half of the same bug: the summary was suppressed but the plan
+    panel still rendered a finished checklist under an unrelated answer."""
+    plan = [{"content": "build the thing", "status": "completed"}]
+    model = Scripted(
+        [
+            AIMessage(content="", tool_calls=[tool_call("write_todos", todos=plan)]),
+            AIMessage("built it"),
+            AIMessage("Status: all done."),
+        ]
+    )
+    orch = build_orchestrator(model=model, root=project)
+
+    shown: list[list] = []
+    ui = NanocodeUI(live=False)
+    ui.set_todos = lambda todos: shown.append(todos)
+
+    _drive(orch, "build it", ui)
+    assert shown, "a real task should render its plan"
+
+    shown.clear()
+    _drive(orch, "tell me status", ui, plan_before=plan)
+    assert shown == [], "an untouched plan should not reappear under a question"
+
+
+def test_the_prompt_forbids_ticking_work_that_was_not_done():
+    """Observed: "Add a small verification script or test" ticked complete
+    while the summary showed one file changed and no test existed."""
+    from nanocode import prompts
+
+    flat = " ".join(prompts.ORCHESTRATOR_PROMPT.lower().split())
+    assert "only mark a todo `completed` if you actually did the thing" in flat
+    assert "is not complete because you added a print statement" in flat
+
+
+def test_the_prompt_requires_verification_that_can_fail():
+    """Observed: "ran python lex_sorter.py and it printed the expected output"
+    — a command that succeeds identically whether or not the code works."""
+    from nanocode import prompts
+
+    flat = " ".join(prompts.ORCHESTRATOR_PROMPT.lower().split())
+    assert "verification must be capable of failing" in flat
+    assert 'if the answer is "the same thing", you have not verified it' in flat
+
+
+def test_the_prompt_tells_it_to_build_rather_than_hunt():
+    """An empty directory plus "write me an X" is unambiguous.
+
+    Observed failure: in an empty folder it planned "locate the existing
+    implementation", searched six times, then stopped with four pending todos
+    and asked what to do.
+    """
+    from nanocode import prompts
+
+    flat = " ".join(prompts.ORCHESTRATOR_PROMPT.lower().split())
+    assert "is **from scratch**" in flat
+    assert "never ask the user a question the directory already answers" in flat
+    assert "discovering your premise was mistaken is a reason to **replan**" in flat
+    assert "pending todos and a question is the worst outcome" in flat
+
+
 # -- picking work up without being asked ----------------------------------
 
 
@@ -262,7 +370,13 @@ def captured(monkeypatch):
         seen.update(opening=opening, task_label=task_label, constraints=constraints or [])
         return 0
 
-    monkeypatch.setattr("nanocode.cli.build_orchestrator", lambda **kw: object())
+    class FakeOrch:
+        """Enough of an Orchestrator for the startup path — which now reads
+        `.git` to put the branch in the header."""
+
+        git = None
+
+    monkeypatch.setattr("nanocode.cli.build_orchestrator", lambda **kw: FakeOrch())
     monkeypatch.setattr("nanocode.cli._session_loop", fake_loop)
     return seen
 

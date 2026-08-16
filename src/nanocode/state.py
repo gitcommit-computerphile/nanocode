@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import operator
 from datetime import datetime, timezone
-from typing import Annotated, Literal, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langchain.agents.middleware import AgentState
 
@@ -33,11 +33,24 @@ class Todo(TypedDict):
 
 
 class Event(TypedDict):
-    """One thing that happened, durable across a resume."""
+    """One thing that happened, durable across a resume.
+
+    `detail` is for a human to read. Anything a *program* needs goes in the
+    optional fields below, because the alternative — formatting numbers into
+    `detail` and regex-ing them back out — means two files must agree on
+    exact wording with nothing checking that they do. A reworded string then
+    breaks the summary silently, and a test that hand-writes the same string
+    still passes.
+    """
 
     kind: EventKind
     detail: str
     ts: str
+    # Set on file_edit events. Read with .get(): older sessions predate them.
+    path: NotRequired[str]
+    added: NotRequired[int]
+    removed: NotRequired[int]
+    created: NotRequired[bool]
 
 
 class NanocodeState(AgentState):
@@ -46,9 +59,40 @@ class NanocodeState(AgentState):
     constraints: NotRequired[list[str]]
 
 
-def event(kind: EventKind, detail: str) -> Event:
-    """Build an Event stamped with the current UTC time."""
-    return Event(kind=kind, detail=detail, ts=datetime.now(timezone.utc).isoformat())
+def event(kind: EventKind, detail: str, **fields: Any) -> Event:
+    """Build an Event stamped with the current UTC time.
+
+    Extra keyword fields carry the structured half — see `file_edit_event`,
+    which is the only caller that needs them today.
+    """
+    return Event(
+        kind=kind, detail=detail, ts=datetime.now(timezone.utc).isoformat(), **fields
+    )
+
+
+def file_edit_event(
+    path: str, added: int, removed: int, created: bool | None = None
+) -> Event:
+    """A file change, recorded as numbers *and* as text.
+
+    `created=None` means a targeted edit (a diff); True or False means a
+    whole-file write that respectively made or replaced the file.
+
+    The text is built here, where the numbers are known, and is read by nobody
+    but a human. Nothing parses it back.
+    """
+    if created is None:
+        detail = f"{path}: +{added} -{removed}"
+    else:
+        detail = f"{path}: {'created' if created else 'overwrote'} ({added} lines)"
+    return event(
+        "file_edit",
+        detail,
+        path=path,
+        added=added,
+        removed=removed,
+        created=bool(created),
+    )
 
 
 def format_todos(todos: list[Todo]) -> str:

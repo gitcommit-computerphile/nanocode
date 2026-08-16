@@ -95,6 +95,16 @@ The bit before the colon picks which API key gets read. `openai:` wants
 `OPENAI_API_KEY`, `anthropic:` wants `ANTHROPIC_API_KEY`. Keys are read once
 when it starts and never end up in `session.json` or the logs.
 
+Sub-agents can run on something cheaper. They grep, read and run tests —
+execution, not judgment — and judgment never leaves the orchestrator:
+
+```bash
+nanocode --model openai:gpt-5.6-sol --subagent-model openai:gpt-5.4-mini
+```
+
+Since exploration is where most tokens go, this is usually the single biggest
+saving available.
+
 To change the default permanently, edit `DEFAULT_MODEL` in
 `src/nanocode/orchestrator.py`. See `run.md` for the details.
 
@@ -109,6 +119,12 @@ went sideways.
 goes. Next time you run it in that folder it picks up where it stopped — the
 plan, and the log of what already happened. No flag to remember; `--fresh` if
 you'd rather start clean. You lose the conversation itself, not the work.
+
+**It knows it's in a git repo.** It sees your branch and which files you've
+already changed, so it won't quietly work on top of your edits — and it can
+read `diff`, `log` and `blame` to check its own work or find out why odd-looking
+code is the way it is. It never commits; that stays your call. Not a git repo?
+Then none of this exists and nothing nags you about it.
 
 **Tell it a rule once and it sticks.** Say "don't touch the auth module" or
 "always run the tests before you tell me you're done" and it writes that to
@@ -144,7 +160,10 @@ Three things get written down, and they're what survives a restart:
 | `constraints.py` | `write_constraints` — the rules that outlive a task |
 | `commands.py` | `/model`, `/clear`, `/help` |
 | `models.py` | asking a provider what a key can reach |
-| `fs_tools.py` | `ls`, `read_file`, `write_file`, `edit_file`, `grep`, `glob` |
+| `git_tool.py` | branch/diff awareness, and a read-only `git` tool |
+| `retry.py` | riding out rate limits and provider blips |
+| `usage.py` | token spend, and how full the context is |
+| `fs_tools.py` | `ls`, `read_file`, `write_file`, `edit_file`, `multi_edit`, `grep`, `glob` |
 | `shell_tool.py` | `shell`, with output truncation and a guard on destructive commands |
 | `subagents.py` | the explorer / coder / test-runner registry and `delegate` |
 | `session.py` | reading and writing `.nanocode/` — sessions and constraints |

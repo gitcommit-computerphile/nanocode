@@ -74,6 +74,7 @@ Type `exit` (or `quit`, or Ctrl-D) when you're finished.
 | Flag | What it does |
 | --- | --- |
 | `--model`, `-m` | Use a different model for this run |
+| `--subagent-model` | Cheaper model for sub-agents only. Defaults to `--model` |
 | `--dir`, `-C` | Work on a different folder than the one you're in |
 | `--once` | Do one task and quit instead of prompting again |
 | `--fresh` | Ignore unfinished work and the saved constraints. Clean slate |

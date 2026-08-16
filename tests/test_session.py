@@ -13,7 +13,7 @@ from nanocode.orchestrator import (
     build_orchestrator,
     resolve_model,
 )
-from nanocode.state import Todo, event
+from nanocode.state import Todo, event, file_edit_event
 from nanocode.subagents import REGISTRY
 from nanocode.ui import _changed_files
 
@@ -192,10 +192,17 @@ def test_gitignore_hint_only_fires_when_relevant(tmp_path):
 
 
 def test_changed_files_folds_the_edit_record():
+    """Built with the real producer, not hand-written strings.
+
+    The previous version of this test wrote the `detail` text itself, which
+    meant it checked the parser against its own assumption rather than against
+    what the filesystem tools actually record. Reword the producer and the test
+    stayed green while every summary silently went blank.
+    """
     log = [
-        event("file_edit", "src/api/middleware.py: +18 -2"),
-        event("file_edit", "src/api/middleware.py: +4 -1"),
-        event("file_edit", "tests/test_middleware.py: created (9 lines)"),
+        file_edit_event("src/api/middleware.py", added=18, removed=2),
+        file_edit_event("src/api/middleware.py", added=4, removed=1),
+        file_edit_event("tests/test_middleware.py", added=9, removed=0, created=True),
         event("shell", "pytest -> exit 0"),
         event("delegate", "explorer: something"),
     ]

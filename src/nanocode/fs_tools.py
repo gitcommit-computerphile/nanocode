@@ -18,7 +18,7 @@ from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 from langgraph.types import Command
 
 from . import prompts
-from .state import event
+from .state import file_edit_event
 
 MAX_GREP_MATCHES = 60
 MAX_GLOB_RESULTS = 100
@@ -240,10 +240,11 @@ def make_fs_tools(fs: FileSystem, *, writable: bool = True) -> list[BaseTool]:
             return _tool_error(tool_call_id, f"could not write {path}: {exc}")
         verb = "overwrote" if existed else "created"
         line_count = len(content.splitlines())
-        detail = f"{path}: {verb} ({line_count} lines)"
         return Command(
             update={
-                "session_log": [event("file_edit", detail)],
+                "session_log": [
+                    file_edit_event(path, added=line_count, removed=0, created=not existed)
+                ],
                 "messages": [ToolMessage(f"{verb} {path} ({line_count} lines)", tool_call_id=tool_call_id)],
             }
         )
@@ -278,15 +279,72 @@ def make_fs_tools(fs: FileSystem, *, writable: bool = True) -> list[BaseTool]:
             return _tool_error(tool_call_id, f"could not write {path}: {exc}")
         removed = len(old_string.splitlines()) or 1
         added = len(new_string.splitlines()) or 1
-        detail = f"{path}: +{added} -{removed}"
         return Command(
             update={
-                "session_log": [event("file_edit", detail)],
+                "session_log": [file_edit_event(path, added=added, removed=removed)],
                 "messages": [ToolMessage(f"edited {path} (+{added} -{removed})", tool_call_id=tool_call_id)],
             }
         )
 
-    return [*tools, write_file, edit_file]
+    @tool("multi_edit", description=prompts.MULTI_EDIT_DESCRIPTION)
+    def multi_edit(
+        path: str,
+        edits: list[dict],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
+        """Several edits to one file, in one call.
+
+        All-or-nothing on purpose. Applying the first three of five edits and
+        failing on the fourth leaves the file in a state neither the model nor
+        the user asked for — and the model would then have to work out which
+        landed. Everything is validated against an in-memory copy first; the
+        disk is only touched once every edit is known to apply.
+        """
+        if not edits:
+            return _tool_error(tool_call_id, "multi_edit needs at least one edit.")
+        try:
+            content = fs.read(path)
+        except RECOVERABLE as exc:
+            return _tool_error(tool_call_id, f"could not read {path}: {exc}")
+
+        added = removed = 0
+        for index, edit in enumerate(edits, 1):
+            old = (edit or {}).get("old_string", "")
+            new = (edit or {}).get("new_string", "")
+            if not old:
+                return _tool_error(tool_call_id, f"edit {index} has no old_string; nothing applied.")
+            occurrences = content.count(old)
+            if occurrences != 1:
+                found = "not found" if occurrences == 0 else f"found {occurrences} times"
+                return _tool_error(
+                    tool_call_id,
+                    f"edit {index} of {len(edits)}: old_string {found} in {path}; it must "
+                    "match exactly once. Nothing was applied — fix this edit and resend "
+                    "the whole call. Note that earlier edits in this same call change what "
+                    "later ones will match against.",
+                )
+            content = content.replace(old, new, 1)
+            removed += len(old.splitlines()) or 1
+            added += len(new.splitlines()) or 1
+
+        try:
+            fs.write(path, content)
+        except RECOVERABLE as exc:
+            return _tool_error(tool_call_id, f"could not write {path}: {exc}")
+
+        return Command(
+            update={
+                "session_log": [file_edit_event(path, added=added, removed=removed)],
+                "messages": [
+                    ToolMessage(
+                        f"applied {len(edits)} edits to {path} (+{added} -{removed})",
+                        tool_call_id=tool_call_id,
+                    )
+                ],
+            }
+        )
+
+    return [*tools, write_file, edit_file, multi_edit]
 
 
 def _tool_error(tool_call_id: str, message: str) -> Command:

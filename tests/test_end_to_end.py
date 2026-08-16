@@ -136,6 +136,133 @@ def test_the_plan_is_recited_into_context_every_turn(project):
         assert "[>] do the thing" in text
 
 
+def test_a_conversational_turn_leaves_no_plan_behind(project):
+    """"hi" is not a task. The graph must not require a plan to complete a turn.
+
+    The prompt is what decides this (a model applying a criterion, not a
+    keyword list — see ORCHESTRATOR_PROMPT), so what's pinned here is the
+    wiring around that decision: a turn that skips write_todos still runs,
+    still renders, and leaves `todos` empty rather than half-built.
+    """
+    model = Scripted([AIMessage("Hi! What would you like me to work on?")])
+    orch = build_orchestrator(model=model, root=project)
+    state = _drive(orch, "hi", NanocodeUI(live=False))
+
+    assert not state.get("todos"), "a greeting should not leave a plan in state"
+    assert not state.get("session_log"), "a greeting should not record work events"
+    assert "What would you like me to work on?" in str(state["messages"][-1].content)
+
+
+def test_no_plan_means_nothing_is_recited(project):
+    """Recitation stays silent with nothing to recite — no empty plan header."""
+    model = Scripted([AIMessage("Hi there.")])
+    orch = build_orchestrator(model=model, root=project)
+    _drive(orch, "hi", NanocodeUI(live=False))
+
+    only_prompt = "\n".join(str(m.content) for m in model.calls[0])
+    assert "## Current plan" not in only_prompt
+    assert "No todos yet" not in only_prompt
+
+
+def test_a_short_real_task_still_gets_planned(project):
+    """The other direction: don't over-correct into skipping real work.
+
+    "run the tests" is three words and *is* a task — brevity is not the signal.
+    """
+    plan = [{"content": "run the test suite", "status": "in_progress"}]
+    model = Scripted(
+        [
+            AIMessage(content="", tool_calls=[tool_call("write_todos", todos=plan)]),
+            AIMessage(content="", tool_calls=[tool_call("ls", path=".")]),
+            AIMessage("Tests pass."),
+        ]
+    )
+    orch = build_orchestrator(model=model, root=project)
+    state = _drive(orch, "run the tests", NanocodeUI(live=False))
+
+    assert state["todos"] == plan
+    assert "## Current plan" in "\n".join(str(m.content) for m in model.calls[1])
+
+
+def test_task_vs_conversation_is_a_criterion_not_a_keyword_list(project):
+    """The rule lives in the prompt, and stays a criterion rather than a list.
+
+    If this fails because the decision moved into control flow, that's the
+    regression worth catching: a hardcoded greeting list silently mishandles
+    every phrasing it doesn't happen to contain.
+    """
+    from pathlib import Path
+
+    from nanocode import cli, prompts
+
+    # Collapse wrapping — the prompt is hard-wrapped, so match on words.
+    flat = " ".join(prompts.ORCHESTRATOR_PROMPT.lower().split())
+    assert "is this asking for concrete work on the project?" in flat
+    assert "judge by intent, not by length or phrasing" in flat
+
+    # No greeting list in the loop that runs before the model gets the message.
+    source = Path(cli.__file__).read_text(encoding="utf-8").lower()
+    for smell in ('"hi"', "'hi'", "hello", "greeting"):
+        assert smell not in source, f"{smell} suggests keyword matching crept into cli.py"
+
+
+def test_a_failing_verification_can_reopen_the_plan(project):
+    """A red suite is new information, not a finished task.
+
+    Nothing in the graph forces this — it's the prompt's job — so what's pinned
+    here is that reopening a plan actually works: a completed todo can go back
+    to in_progress, new steps can appear, and state follows.
+    """
+    done = [
+        {"content": "add the feature", "status": "completed"},
+        {"content": "run the tests", "status": "completed"},
+    ]
+    reopened = [
+        {"content": "add the feature", "status": "completed"},
+        {"content": "run the tests", "status": "completed"},
+        {"content": "fix test_rate_limit_headers, which the change broke", "status": "in_progress"},
+    ]
+    model = Scripted(
+        [
+            AIMessage(content="", tool_calls=[tool_call("write_todos", todos=done)]),
+            AIMessage(content="", tool_calls=[tool_call("write_todos", todos=reopened)]),
+            AIMessage("Fixed the handler; the suite passes now."),
+        ]
+    )
+    orch = build_orchestrator(model=model, root=project)
+    state = _drive(orch, "add rate limiting", NanocodeUI(live=False))
+
+    assert state["todos"] == reopened
+    assert len(state["todos"]) == 3, "a failure should be able to add steps after 'completion'"
+
+
+def test_the_prompt_demands_verification_and_honesty(project):
+    """These five rules are the whole point of the change; pin the wording.
+
+    They're prompt-level judgment, so a behavioural test would need a real
+    model. What's cheap and worth guarding is that the rules haven't been
+    quietly dropped from the prompt during an edit.
+    """
+    from nanocode import prompts
+
+    flat = " ".join(prompts.ORCHESTRATOR_PROMPT.lower().split())
+
+    # 1 — verification is a plan step, but only when it means something
+    assert "end the plan with a verification step" in flat
+    assert "does not earn a verification step" in flat
+    # 2 — a failure reopens the plan
+    assert "add todos, do not finish" in flat
+    # 3 — the rule that matters most
+    assert "fix the code, never the test" in flat
+    # 4 — stop rather than thrash
+    assert "stop after about three attempts" in flat
+    # 5 — honest finish
+    assert "never describe a task as done over a failing suite" in flat
+
+    # The same rule has to hold in the other place edits happen.
+    assert "never weaken the test" in " ".join(prompts.CODER_PROMPT.lower().split())
+
+
 def test_the_sandbox_holds_during_a_real_run(project):
     """A model that tries to escape the root gets an error, not the file."""
     outside = project.parent / "outside_secret.txt"

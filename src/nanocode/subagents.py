@@ -28,6 +28,7 @@ from .fs_tools import FileSystem, make_fs_tools
 from .search_tool import make_search_tool
 from .shell_tool import make_shell_tool
 from .state import NanocodeState, event
+from .usage import usage_of
 
 SUBAGENT_RECURSION_LIMIT = 60
 
@@ -70,11 +71,18 @@ def make_delegate_tool(
     fs: FileSystem,
     root: str | Path,
     on_trace: Callable[[str, str], None] | None = None,
+    on_usage: Callable[[int, int], None] | None = None,
+    middleware: list | None = None,
 ) -> BaseTool:
     """Build the delegate tool.
 
     `on_trace(agent_type, line)` is an optional UI hook; it is called as the
     sub-agent works and has no effect on what the orchestrator sees.
+
+    `on_usage(input_tokens, output_tokens)` reports what the sub-agent's run
+    cost. It has to be reported explicitly here because a sub-agent's messages
+    are discarded rather than returned to the parent — so nothing downstream
+    would ever see them, and delegated work would look free.
     """
     project_root = Path(root).resolve()
 
@@ -107,6 +115,7 @@ def make_delegate_tool(
             tools=spec.build_tools(fs, project_root),
             system_prompt=spec.prompt,
             state_schema=NanocodeState,
+            middleware=list(middleware or []),
             name=spec.name,
         )
 
@@ -129,7 +138,11 @@ def make_delegate_tool(
                 }
             )
 
-        summary = _final_text(result.get("messages", []))
+        messages = result.get("messages", [])
+        if on_usage:
+            on_usage(*usage_of(messages))
+
+        summary = _final_text(messages)
         if on_trace:
             on_trace(spec.name, f"returned: {summary[:120]}")
 
