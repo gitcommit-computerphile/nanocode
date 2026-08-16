@@ -1,5 +1,11 @@
 # nanocode
 
+
+
+https://github.com/user-attachments/assets/4012bc47-816d-45cb-9b09-f2699dbdf99d
+
+
+
 A small coding agent that runs in your terminal. You point it at a project,
 tell it what you want, and it goes off and does it: makes a plan, greps around,
 edits files, runs your tests. Then it asks what's next.
